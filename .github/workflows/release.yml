@@ -50,8 +50,9 @@ jobs:
           Write-Host "Installing WDK package: $wdkId"
           winget install --id $wdkId --source winget --silent --accept-package-agreements --accept-source-agreements
 
-          $vsixDir = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Vsix\VS2022" -Directory | Sort-Object Name -Descending | Select-Object -First 1
-          $vsix = Join-Path $vsixDir.FullName "WDK.vsix"
+          $vsix = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10" -Recurse -Filter "WDK.vsix" -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $vsix) { throw "Could not find WDK.vsix anywhere under Windows Kits\10" }
           Write-Host "Using VSIX: $vsix"
           $vsixInstaller = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products '*' -find "Common7\IDE\VSIXInstaller.exe"
 
