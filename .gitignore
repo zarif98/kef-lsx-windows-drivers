@@ -1,0 +1,6 @@
+*.exe
+*.obj
+*.res
+*.pdb
+*.ilk
+sysvad-src/

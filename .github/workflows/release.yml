@@ -1,0 +1,121 @@
+name: Build and release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+jobs:
+  build-tools:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Locate VS dev environment
+        id: vs
+        shell: pwsh
+        run: |
+          $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products '*' -property installationPath
+          "vsPath=$vsPath" >> $env:GITHUB_OUTPUT
+
+      - name: Build AutoOn.exe and KefEndpointBridge.exe
+        shell: cmd
+        run: |
+          call "${{ steps.vs.outputs.vsPath }}\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cd tools
+          cl /nologo /EHsc /O2 /DUNICODE /D_UNICODE /Fe:AutoOn.exe AutoOn.cpp /link /SUBSYSTEM:WINDOWS ole32.lib
+          cl /nologo /EHsc /O2 /DUNICODE /D_UNICODE /Fe:KefEndpointBridge.exe KefEndpointBridge.cpp /link /SUBSYSTEM:WINDOWS ole32.lib advapi32.lib
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-tools
+          path: |
+            tools/AutoOn.exe
+            tools/KefEndpointBridge.exe
+
+  build-driver:
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - name: Install WDK (msi) and its VS extension
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          winget install --id Microsoft.WindowsWDK.10.0.22621 --source winget --silent --accept-package-agreements --accept-source-agreements
+
+          $vsixDir = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Vsix\VS2022" -Directory | Select-Object -First 1
+          $vsix = Join-Path $vsixDir.FullName "WDK.vsix"
+          $vsixInstaller = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products '*' -find "Common7\IDE\VSIXInstaller.exe"
+
+          Get-Process -Name devenv,MSBuild -ErrorAction SilentlyContinue | Stop-Process -Force
+          $p = Start-Process -FilePath $vsixInstaller -ArgumentList "/quiet","/admin","`"$vsix`"" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "WDK.vsix install failed with exit code $($p.ExitCode)" }
+
+      - name: Install matching Spectre-mitigated libraries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $setup = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
+          $installPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products '*' -property installationPath
+
+          $instanceId = (& "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products '*' -property instanceId)
+          $catalog = "C:\ProgramData\Microsoft\VisualStudio\Packages\_Instances\$instanceId\catalog.json"
+
+          # Find the exact versioned Spectre component ID matching the installed toolset,
+          # rather than hardcoding a version that may not exist on this runner image.
+          $catalogText = Get-Content $catalog -Raw
+          $matches = [regex]::Matches($catalogText, '"id":"(Microsoft\.VisualStudio\.Component\.VC\.\d+\.\d+\.\d+\.\d+\.x86\.x64\.Spectre)"')
+          $spectreId = ($matches | Select-Object -Last 1).Groups[1].Value
+          if (-not $spectreId) { throw "Could not find a versioned x86.x64 Spectre component id in catalog" }
+          Write-Host "Using Spectre component: $spectreId"
+
+          # First invocation may just self-update the installer; retry once for the real install.
+          for ($i = 0; $i -lt 2; $i++) {
+            & $setup modify --installPath $installPath --add $spectreId --add Microsoft.VisualStudio.Component.VC.ATL.Spectre --quiet --norestart
+          }
+
+      - name: Sparse-checkout SysVAD sample + WIL submodule
+        shell: bash
+        run: |
+          mkdir sysvad-src && cd sysvad-src
+          git init -q
+          git remote add origin https://github.com/microsoft/Windows-driver-samples.git
+          git config core.sparseCheckout true
+          mkdir -p .git/info
+          echo "audio/sysvad/*" > .git/info/sparse-checkout
+          git fetch --depth 1 origin main
+          git checkout main
+          git submodule update --init
+
+      - name: Build SysVAD (test-signed)
+        shell: pwsh
+        run: |
+          $msbuild = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products '*' -find "MSBuild\Current\Bin\MSBuild.exe"
+          & $msbuild "sysvad-src\audio\sysvad\sysvad.sln" /p:Configuration=Debug /p:Platform=x64 /m
+
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: sysvad-driver-package
+          path: sysvad-src/audio/sysvad/x64/Debug/package/**
+
+  release:
+    needs: [build-tools, build-driver]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Zip artifacts
+        run: |
+          cd artifacts
+          for d in */; do (cd "$d" && zip -r "../${d%/}.zip" .); done
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.zip
+          generate_release_notes: true
